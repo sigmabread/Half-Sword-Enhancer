@@ -1,157 +1,82 @@
-#include <thread>
-#include <chrono>
-#include <Windows.h>
-
 #include "../include/ProcessManager.h"
-#include "../include/Logger.h"
+
+#include <TlHelp32.h>
+#include <thread>
+#include <filesystem>
+#include <shellapi.h>
+
+namespace fs = std::filesystem;
 
 namespace hse {
 
-    std::expected<DWORD, ProcessError> ProcessManager::LocateOrStartGame() noexcept {
-        auto processId = FindGameProcess();
-        if (processId) {
-            return *processId;
+    std::expected<DWORD, ProcessError>
+    ProcessManager::LocateOrStartGame() noexcept {
+
+        if (auto pid = FindGameProcess()) {
+            return *pid;
         }
 
-        hse::Logger::info("Starting Half Sword...");
-        auto startResult = StartGameViaStream();
-        if (!startResult) {
-            return std::unexpected(startResult.error());
+        if (auto start = StartGameViaSteam(); !start) {
+            return std::unexpected(start.error());
         }
 
-        hse::Logger::info("Waiting for game window...");
-        const auto maxWaitTime = std::chrono::steady_clock::now() + MAX_GAME_WAIT_TIME;
+        const auto timeout =
+            std::chrono::steady_clock::now() + MAX_GAME_WAIT_TIME;
 
-        while (std::chrono::steady_clock::now() < maxWaitTime) {
-            processId = FindGameProcess();
-            if (processId) {
-                return *processId;
+        while (std::chrono::steady_clock::now() < timeout) {
+
+            if (auto pid = FindGameProcess()) {
+                return *pid;
             }
+
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
         return std::unexpected(ProcessError::GameNotFound);
     }
 
-    std::expected<void, ProcessError> ProcessManager::InjectDLL(
-        DWORD processId,
-        std::string_view dllPath
-    ) noexcept {
+    std::expected<DWORD, ProcessError>
+    ProcessManager::FindGameProcess() const noexcept {
 
-        if (dllPath.empty()) {
-            return std::unexpected(ProcessError::InvalidDllPath);
-        }
-
-        auto processHandle = OpenGameProcess(processId);
-        if (!processHandle) {
-            return std::unexpected(processHandle.error());
-        }
-
-        const SIZE_T pathSize = dllPath.length() + 1;
-        LPVOID remotePath = VirtualAllocEx(
-            processHandle->get(),
-            nullptr,
-            pathSize,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE
+        HANDLE snapshot = CreateToolhelp32Snapshot(
+            TH32CS_SNAPPROCESS,
+            0
         );
 
-        if (!remotePath) {
-            return std::unexpected(ProcessError::MemoryAllocationFailed);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return std::unexpected(ProcessError::GameNotFound);
         }
 
-        struct MemoryGuard {
-            HANDLE process;
-            LPVOID memory;
-            ~MemoryGuard() {
-                if (memory && process) VirtualFreeEx(process, memory, 0, MEM_RELEASE);
+        ProcessHandle snapshotGuard(snapshot);
+
+        PROCESSENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+
+        if (!Process32FirstW(snapshot, &entry)) {
+            return std::unexpected(ProcessError::GameNotFound);
+        }
+
+        do {
+
+            if (_wcsicmp(entry.szExeFile, GAME_EXE_NAME) == 0) {
+                return entry.th32ProcessID;
             }
-        } memGuard{ processHandle->get(), remotePath };
 
-        SIZE_T bytesWritten;
-        if (!WriteProcessMemory(
-            processHandle->get(),
-            remotePath,
-            dllPath.data(),
-            pathSize,
-            &bytesWritten) || bytesWritten != pathSize) {
-            return std::unexpected(ProcessError::DllPathWriteFailed);
-        }
+        } while (Process32NextW(snapshot, &entry));
 
-        HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
-        if (!kernel32) {
-            return std::unexpected(ProcessError::ThreadCreationFailed);
-        }
-
-        FARPROC loadLibraryAddr = GetProcAddress(kernel32, "LoadLibraryA");
-        if (!loadLibraryAddr) {
-            return std::unexpected(ProcessError::ThreadCreationFailed);
-        }
-
-        HANDLE hThread = CreateRemoteThread(
-            processHandle->get(),
-            nullptr,
-            0,
-            reinterpret_cast<LPTHREAD_START_ROUTINE>(loadLibraryAddr),
-            remotePath,
-            0,
-            nullptr
-        );
-
-        if (!hThread) {
-            return std::unexpected(ProcessError::ThreadCreationFailed);
-        }
-
-        struct ThreadGuard {
-            HANDLE handle;
-            ~ThreadGuard() { if (handle) CloseHandle(handle); }
-        } threadGuard{ hThread };
-
-        const DWORD waitResult = WaitForSingleObject(hThread, static_cast<DWORD>(INJECTION_TIMEOUT.count()));
-        if (waitResult != WAIT_OBJECT_0) {
-            return std::unexpected(ProcessError::InjectionTimeout);
-        }
-
-        DWORD exitCode;
-        if (!GetExitCodeThread(hThread, &exitCode)) {
-            hse::Logger::error("Failed to get thread exit code");
-            return std::unexpected(ProcessError::ThreadCreationFailed);
-        }
-
-        if (exitCode == 0) {
-            hse::Logger::error("LoadLibraryA failed - DLL was not loaded into the target process");
-            hse::Logger::error("Common causes: Antivirus blocking or corrupted DLL file");
-            return std::unexpected(ProcessError::DllLoadFailed);
-        }
-
-        hse::Logger::info("DLL injection completed successfully");
-        return {};
+        return std::unexpected(ProcessError::GameNotFound);
     }
 
-    std::expected<DWORD, ProcessError> ProcessManager::FindGameProcess() const noexcept {
-        const HWND gameWindow = FindWindowA(GAME_WINDOW_CLASS.data(), nullptr);
-        if (!gameWindow) {
-            return std::unexpected(ProcessError::GameNotFound);
-        }
+    std::expected<void, ProcessError>
+    ProcessManager::StartGameViaSteam() const noexcept {
 
-        DWORD processId = 0;
-        GetWindowThreadProcessId(gameWindow, &processId);
-
-        if (processId == 0) {
-            return std::unexpected(ProcessError::GameNotFound);
-        }
-
-        return processId;
-    }
-
-    std::expected<void, ProcessError> ProcessManager::StartGameViaStream() const noexcept {
-        const HINSTANCE result = ShellExecuteA(
+        HINSTANCE result = ShellExecuteW(
             nullptr,
-            "open",
-            STEAM_GAME_URL.data(),
+            L"open",
+            STEAM_GAME_URL,
             nullptr,
             nullptr,
-            SW_SHOW
+            SW_SHOWDEFAULT
         );
 
         if (reinterpret_cast<INT_PTR>(result) <= 32) {
@@ -161,11 +86,17 @@ namespace hse {
         return {};
     }
 
-    std::expected<ProcessHandle, ProcessError> ProcessManager::OpenGameProcess(DWORD pid) const noexcept {
+    std::expected<ProcessHandle, ProcessError>
+    ProcessManager::OpenGameProcess(DWORD pid) const noexcept {
+
         HANDLE handle = OpenProcess(
-            PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION,
+            PROCESS_CREATE_THREAD |
+            PROCESS_VM_OPERATION |
+            PROCESS_VM_WRITE |
+            PROCESS_VM_READ |
+            PROCESS_QUERY_INFORMATION,
             FALSE,
-            static_cast<DWORD>(pid)
+            pid
         );
 
         if (!handle || handle == INVALID_HANDLE_VALUE) {
@@ -173,6 +104,127 @@ namespace hse {
         }
 
         return ProcessHandle(handle);
+    }
+
+    std::expected<void, ProcessError>
+    ProcessManager::InjectDLL(
+        DWORD processId,
+        const std::wstring& dllPath
+    ) noexcept {
+
+        if (dllPath.empty() || !fs::exists(dllPath)) {
+            return std::unexpected(ProcessError::InvalidDllPath);
+        }
+
+        auto process = OpenGameProcess(processId);
+
+        if (!process) {
+            return std::unexpected(process.error());
+        }
+
+        const SIZE_T allocSize =
+            (dllPath.size() + 1) * sizeof(wchar_t);
+
+        LPVOID remoteMemory = VirtualAllocEx(
+            process->get(),
+            nullptr,
+            allocSize,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE
+        );
+
+        if (!remoteMemory) {
+            return std::unexpected(ProcessError::MemoryAllocationFailed);
+        }
+
+        struct RemoteMemoryGuard {
+            HANDLE process{};
+            LPVOID memory{};
+
+            ~RemoteMemoryGuard() {
+                if (process && memory) {
+                    VirtualFreeEx(
+                        process,
+                        memory,
+                        0,
+                        MEM_RELEASE
+                    );
+                }
+            }
+        };
+
+        RemoteMemoryGuard guard{
+            process->get(),
+            remoteMemory
+        };
+
+        SIZE_T written{};
+
+        if (!WriteProcessMemory(
+            process->get(),
+            remoteMemory,
+            dllPath.c_str(),
+            allocSize,
+            &written
+        ) || written != allocSize) {
+
+            return std::unexpected(ProcessError::DllPathWriteFailed);
+        }
+
+        HMODULE kernel32 =
+            GetModuleHandleW(L"kernel32.dll");
+
+        if (!kernel32) {
+            return std::unexpected(ProcessError::ThreadCreationFailed);
+        }
+
+        auto loadLibrary =
+            reinterpret_cast<LPTHREAD_START_ROUTINE>(
+                GetProcAddress(kernel32, "LoadLibraryW")
+            );
+
+        if (!loadLibrary) {
+            return std::unexpected(ProcessError::ThreadCreationFailed);
+        }
+
+        HANDLE thread = CreateRemoteThread(
+            process->get(),
+            nullptr,
+            0,
+            loadLibrary,
+            remoteMemory,
+            0,
+            nullptr
+        );
+
+        if (!thread) {
+            return std::unexpected(ProcessError::ThreadCreationFailed);
+        }
+
+        ProcessHandle threadGuard(thread);
+
+        DWORD waitResult = WaitForSingleObject(
+            thread,
+            static_cast<DWORD>(
+                INJECTION_TIMEOUT.count() * 1000
+            )
+        );
+
+        if (waitResult != WAIT_OBJECT_0) {
+            return std::unexpected(ProcessError::InjectionTimeout);
+        }
+
+        DWORD remoteModule{};
+
+        if (!GetExitCodeThread(thread, &remoteModule)) {
+            return std::unexpected(ProcessError::ThreadCreationFailed);
+        }
+
+        if (remoteModule == 0) {
+            return std::unexpected(ProcessError::DllLoadFailed);
+        }
+
+        return {};
     }
 
 }
